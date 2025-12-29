@@ -1,0 +1,10 @@
+# LiteLLM Handlers Hub - Dependencies
+
+# Core LiteLLM
+litellm>=1.0.0
+
+# Clipboard Handler
+pyperclip>=1.8.0
+
+# Optional but recommended
+python-dotenv>=1.0.0  # For environment variable management
