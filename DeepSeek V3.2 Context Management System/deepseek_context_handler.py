@@ -1,22 +1,21 @@
 """
-DeepSeek V3.2 Dual-Format Context Handler
+DeepSeek V3.2 Context Handler (OpenAI Format)
 
 This handler implements context management rules for DeepSeek V3.2 model
-across both OpenAI-compatible and Anthropic-native LiteLLM endpoints:
+using OpenAI-compatible format via LiteLLM endpoints.
 
 Core Rules:
 1. Preserve reasoning during tool interactions (keep all reasoning content)
 2. Discard reasoning on new user input (strip all reasoning content)
 3. Always preserve tool history (tool calls and results must stay intact)
 
-Supported Formats:
-- OpenAI-compatible: /v1/chat/completions (DeepSeek, OpenAI, etc.)
-- Anthropic-native: /v1/messages (Claude models)
+Note: LiteLLM automatically converts all endpoint formats to OpenAI-compatible
+format before reaching this handler, so we only need to handle OpenAI format.
 """
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.prompt_templates.common_utils import _parse_content_for_reasoning
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 import logging
 import json
 import os
@@ -28,40 +27,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DualFormatContextHandler(CustomLogger):
-    """Handler for DeepSeek V3.2 context management with dual endpoint support."""
+class DeepSeekContextHandler(CustomLogger):
+    """Handler for DeepSeek V3.2 context management (OpenAI format only)."""
 
     def __init__(self):
         """Initialize the handler."""
         super().__init__()
-
-    # ==================== Endpoint Detection ====================
-
-    def _is_anthropic_request(self, data: Dict[str, Any]) -> bool:
-        """
-        Detect if the request targets the Anthropic endpoint.
-
-        Checks:
-        - Model name patterns (claude-3, claude-4, etc.)
-        - Anthropic-specific headers
-        - Provider metadata
-        """
-        # Check model name
-        model = data.get("model", "").lower()
-        if "claude" in model:
-            return True
-
-        # Check headers for Anthropic-specific indicators
-        headers = data.get("headers", {})
-        if "anthropic-version" in headers or "anthropic-beta" in headers:
-            return True
-
-        # Check provider metadata
-        metadata = data.get("metadata", {})
-        if metadata.get("provider") == "anthropic":
-            return True
-
-        return False
 
     # ==================== Message Type Detection ====================
 
@@ -77,15 +48,7 @@ class DualFormatContextHandler(CustomLogger):
         if role in ["tool", "function"]:
             return "tool"
 
-        # Anthropic format: tool results embedded in user messages
-        if role == "user":
-            content = message.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if block.get("type") == "tool_result":
-                        return "tool"
-
-        # STEP 2.2: Check for tool instruction messages masquerading as user
+        # Check for tool instruction messages masquerading as user
         if role == "user" and messages is not None and message_index is not None:
             if self._is_tool_instruction_message(message, messages, message_index):
                 return "tool_instruction"
@@ -100,29 +63,15 @@ class DualFormatContextHandler(CustomLogger):
 
     # ==================== Tool Call Detection ====================
 
-    def _has_tool_calls_openai(self, message: Dict[str, Any]) -> bool:
-        """Check if an OpenAI-format assistant message contains tool calls."""
+    def _has_tool_calls(self, message: Dict[str, Any]) -> bool:
+        """Check if an assistant message contains tool calls (OpenAI format)."""
         return bool(message.get("tool_calls"))
-
-    def _has_tool_calls_anthropic(self, message: Dict[str, Any]) -> bool:
-        """Check if an Anthropic-format assistant message contains tool calls."""
-        content = message.get("content")
-        if not isinstance(content, list):
-            return False
-
-        return any(block.get("type") == "tool_use" for block in content)
-
-    def _has_tool_calls(self, message: Dict[str, Any], is_anthropic: bool) -> bool:
-        """Unified tool call detection across formats."""
-        if is_anthropic:
-            return self._has_tool_calls_anthropic(message)
-        return self._has_tool_calls_openai(message)
 
     # ==================== Reasoning Extraction ====================
 
-    def _extract_reasoning_openai(self, content: str) -> tuple[Optional[str], str]:
+    def _extract_reasoning(self, content: str) -> tuple[Optional[str], str]:
         """
-        Extract reasoning content from OpenAI format ( tags).
+        Extract reasoning content from OpenAI format (<think> tags).
 
         Returns: (reasoning_content, cleaned_content)
         """
@@ -133,88 +82,21 @@ class DualFormatContextHandler(CustomLogger):
             reasoning, cleaned = _parse_content_for_reasoning(content)
             return reasoning, cleaned
         except Exception as e:
-            logger.warning(f"Failed to extract OpenAI reasoning: {e}")
+            logger.warning(f"Failed to extract reasoning: {e}")
             return None, content
-
-    def _extract_reasoning_anthropic(self, content: Union[str, List[Dict[str, Any]]]) -> tuple[Optional[str], Union[str, List[Dict[str, Any]]]]:
-        """
-        Extract reasoning content from Anthropic format (thinking blocks).
-
-        Returns: (reasoning_content, cleaned_content)
-        """
-        if not content:
-            return None, content
-
-        # Handle string content (simple case)
-        if isinstance(content, str):
-            return None, content
-
-        # Handle content blocks array
-        if not isinstance(content, list):
-            return None, content
-
-        reasoning_parts = []
-        cleaned_blocks = []
-
-        for block in content:
-            block_type = block.get("type")
-
-            # Extract reasoning from thinking blocks
-            if block_type in ["thinking", "redacted_thinking"]:
-                thinking_content = block.get("thinking", "")
-                if thinking_content:
-                    reasoning_parts.append(thinking_content)
-            else:
-                # Preserve all other blocks
-                cleaned_blocks.append(block)
-
-        reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
-        cleaned_content = cleaned_blocks if cleaned_blocks else content
-
-        return reasoning, cleaned_content
-
-    def _extract_reasoning_unified(self, message: Dict[str, Any], is_anthropic: bool) -> tuple[Optional[str], Any]:
-        """
-        Unified reasoning extraction across formats.
-
-        Returns: (reasoning_content, cleaned_content)
-        """
-        content = message.get("content")
-
-        if is_anthropic:
-            return self._extract_reasoning_anthropic(content)
-        else:
-            return self._extract_reasoning_openai(content)
 
     # ==================== Reasoning Removal ====================
 
-    def _remove_reasoning_openai(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove reasoning content from OpenAI-format message."""
+    def _remove_reasoning_from_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove reasoning content from a message."""
         new_message = message.copy()
         content = message.get("content")
 
         if content and isinstance(content, str):
-            _, cleaned = self._extract_reasoning_openai(content)
+            _, cleaned = self._extract_reasoning(content)
             new_message["content"] = cleaned
 
         return new_message
-
-    def _remove_reasoning_anthropic(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove reasoning content from Anthropic-format message."""
-        new_message = message.copy()
-        content = message.get("content")
-
-        if content:
-            _, cleaned = self._extract_reasoning_anthropic(content)
-            new_message["content"] = cleaned
-
-        return new_message
-
-    def _remove_reasoning_from_message(self, message: Dict[str, Any], is_anthropic: bool) -> Dict[str, Any]:
-        """Unified reasoning removal across formats."""
-        if is_anthropic:
-            return self._remove_reasoning_anthropic(message)
-        return self._remove_reasoning_openai(message)
 
     # ==================== Interaction Detection ====================
 
@@ -255,7 +137,7 @@ class DualFormatContextHandler(CustomLogger):
 
         content_lower = content.lower()
 
-        # STEP 1.2: Pattern matching with signature indicators
+        # Pattern matching with signature indicators
         tool_instruction_patterns = [
             # Imperative commands
             r"you must respond with",
@@ -291,11 +173,10 @@ class DualFormatContextHandler(CustomLogger):
             logger.info(f"🎯 Detected tool instruction message (pattern score: {pattern_score})")
             return True
 
-        # STEP 1.3: Contextual validation - check if next message has tool calls
+        # Contextual validation - check if next message has tool calls
         if message_index + 1 < len(messages):
             next_message = messages[message_index + 1]
             if next_message.get("role", "").lower() == "assistant":
-                # Check if assistant has tool calls
                 if next_message.get("tool_calls"):
                     logger.info("🎯 Contextual validation: next message has tool calls")
                     return True
@@ -304,7 +185,7 @@ class DualFormatContextHandler(CustomLogger):
 
     # ==================== Message Filtering ====================
 
-    def _filter_messages_with_rules(self, messages: List[Dict[str, Any]], is_anthropic: bool) -> List[Dict[str, Any]]:
+    def _filter_messages_with_rules(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Apply the three core rules to filter messages.
 
@@ -329,13 +210,13 @@ class DualFormatContextHandler(CustomLogger):
             for idx, message in enumerate(messages):
                 message_type = self._detect_message_type(message, messages, idx)
 
-                # STEP 2.3: Always preserve tool history and tool instructions (Rule 3)
+                # Rule 3: Always preserve tool history and tool instructions
                 if message_type in ["tool", "tool_instruction"]:
                     # Tool and tool instruction messages - keep as is
                     filtered_messages.append(message.copy())
                 else:
                     # User and assistant messages - remove reasoning
-                    filtered_message = self._remove_reasoning_from_message(message, is_anthropic)
+                    filtered_message = self._remove_reasoning_from_message(message)
                     filtered_messages.append(filtered_message)
 
             return filtered_messages
@@ -349,9 +230,9 @@ class DualFormatContextHandler(CustomLogger):
             # Default: preserve everything
             return messages.copy()
 
-    # ==================== Main Hook ====================
+    # ==================== Debug Dump ====================
 
-    def _dump_raw_conversation_turn(self, messages: List[Dict[str, Any]], is_anthropic: bool) -> None:
+    def _dump_raw_conversation_turn(self, messages: List[Dict[str, Any]]) -> None:
         """
         Dump raw conversation turns to JSON for debugging tool message structures.
 
@@ -365,13 +246,11 @@ class DualFormatContextHandler(CustomLogger):
 
             # Generate timestamped filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            format_name = "anthropic" if is_anthropic else "openai"
-            filename = f"{debug_dir}/conversation_{format_name}_{timestamp}.json"
+            filename = f"{debug_dir}/conversation_{timestamp}.json"
 
             # Prepare dump data with metadata
             dump_data = {
                 "timestamp": datetime.now().isoformat(),
-                "format": format_name,
                 "message_count": len(messages),
                 "messages": []
             }
@@ -381,13 +260,13 @@ class DualFormatContextHandler(CustomLogger):
                 message_copy = message.copy()
                 message_type = self._detect_message_type(message, messages, idx)
 
-                # STEP 2.4: Add debug metadata including tool instruction flag
+                # Add debug metadata including tool instruction flag
                 is_tool_instruction = (message_type == "tool_instruction")
                 message_copy["_debug"] = {
                     "index": idx,
                     "detected_type": message_type,
                     "role": message.get("role", "unknown"),
-                    "has_tool_calls": self._has_tool_calls(message, is_anthropic),
+                    "has_tool_calls": self._has_tool_calls(message),
                     "is_tool_instruction": is_tool_instruction
                 }
 
@@ -402,6 +281,8 @@ class DualFormatContextHandler(CustomLogger):
         except Exception as e:
             logger.error(f"Failed to dump conversation to JSON: {e}", exc_info=True)
 
+    # ==================== Main Hook ====================
+
     async def async_pre_call_hook(
         self,
         user_api_key_dict: Any,
@@ -412,7 +293,8 @@ class DualFormatContextHandler(CustomLogger):
         """
         Main hook that filters messages before they're sent to the model.
 
-        Applies the three core rules across both OpenAI and Anthropic formats.
+        Applies the three core rules using OpenAI format (LiteLLM converts all
+        formats to OpenAI-compatible before reaching this handler).
         """
         try:
             messages = data.get("messages", [])
@@ -421,16 +303,13 @@ class DualFormatContextHandler(CustomLogger):
                 logger.debug("No messages to process")
                 return data
 
-            # Detect endpoint format
-            is_anthropic = self._is_anthropic_request(data)
-            format_name = "Anthropic" if is_anthropic else "OpenAI"
-            logger.info(f"Processing {format_name} format request")
+            logger.info("Processing OpenAI format request")
 
             # Dump raw conversation for debugging tool structures
-            self._dump_raw_conversation_turn(messages, is_anthropic)
+            self._dump_raw_conversation_turn(messages)
 
             # Apply filtering rules
-            filtered_messages = self._filter_messages_with_rules(messages, is_anthropic)
+            filtered_messages = self._filter_messages_with_rules(messages)
 
             # Update data with filtered messages
             data["messages"] = filtered_messages
@@ -446,4 +325,4 @@ class DualFormatContextHandler(CustomLogger):
 
 
 # Create handler instance for use in proxy_config.yaml
-dual_format_handler = DualFormatContextHandler()
+deepseek_context_handler = DeepSeekContextHandler()
