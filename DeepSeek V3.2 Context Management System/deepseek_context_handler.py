@@ -1,230 +1,359 @@
+ ```litellm-handlers-hub/DeepSeek V3.2 Context Management System/deepseek_context_handler.py
 """
-DeepSeek V3.2 Context Handler (OpenAI Format) - v2.0
+DeepSeek V3.2 Context Handler - v3.0 (Clean Slate)
 
-This handler implements context management rules for DeepSeek V3.2 model
-using OpenAI-compatible format via LiteLLM endpoints.
+Proper three-hook architecture for DeepSeek V3.2 reasoning content management.
+Uses session-based storage with Redis primary and in-memory fallback.
 
 Core Rules:
-1. Preserve reasoning during tool interactions (keep all reasoning content)
-2. Discard reasoning on new user input (strip all reasoning content)
-3. Always preserve tool history (tool calls and results must stay intact)
-
-Key Implementation Details:
-- Uses async_post_call_success_hook to inspect responses AFTER model generation
-- Accesses reasoning_content directly from response.choices[0].message.reasoning_content
-- Does NOT modify raw messages - reasoning exists naturally in the response structure
+1. Strip reasoning on new user input (async_pre_call_hook)
+2. Inject stored reasoning for tool-only turns (async_get_chat_completion_prompt)
+3. Capture and store reasoning from responses (async_post_call_success_hook)
 """
+
+import json
+import logging
+import os
+import uuid
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Tuple
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.proxy_server import UserAPIKeyAuth
-from litellm.types.utils import ModelResponse, Choices
-from typing import List, Dict, Any, Optional
-import logging
-import json
-import os
-import re
-from datetime import datetime
+from litellm.types.utils import ModelResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DeepSeekContextHandler(CustomLogger):
-    """Handler for DeepSeek V3.2 context management using post-call hooks."""
+# ==================== Storage Abstraction ====================
+
+class BaseStorage(ABC):
+    """Abstract base for reasoning storage backends."""
+
+    @abstractmethod
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve stored reasoning for a session."""
+        pass
+
+    @abstractmethod
+    async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
+        """Store reasoning for a session with TTL."""
+        pass
+
+    @abstractmethod
+    async def delete(self, session_id: str) -> None:
+        """Delete stored reasoning for a session."""
+        pass
+
+
+class InMemoryStorage(BaseStorage):
+    """In-memory storage for development/testing."""
 
     def __init__(self):
-        """Initialize the handler."""
+        self._store: Dict[str, Dict[str, Any]] = {}
+
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return self._store.get(session_id)
+
+    async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
+        # TTL is ignored in memory, but we store it for compatibility
+        data["_ttl"] = ttl
+        self._store[session_id] = data
+
+    async def delete(self, session_id: str) -> None:
+        self._store.pop(session_id, None)
+
+
+class RedisStorage(BaseStorage):
+    """Redis-backed storage for production."""
+
+    def __init__(self, host: str, port: int, password: Optional[str] = None, db: int = 0):
+        try:
+            import redis.asyncio as redis
+            self._redis = redis.Redis(
+                host=host,
+                port=port,
+                password=password,
+                db=db,
+                decode_responses=True
+            )
+            logger.info("✅ Redis storage initialized")
+        except ImportError:
+            logger.error("❌ redis package not installed. Run: pip install redis")
+            raise
+
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = await self._redis.get(f"deepseek:reasoning:{session_id}")
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return None
+
+    async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
+        try:
+            key = f"deepseek:reasoning:{session_id}"
+            await self._redis.setex(key, ttl, json.dumps(data))
+        except Exception as e:
+            logger.error(f"Redis set error: {e}")
+
+    async def delete(self, session_id: str) -> None:
+        try:
+            await self._redis.delete(f"deepseek:reasoning:{session_id}")
+        except Exception as e:
+            logger.error(f"Redis delete error: {e}")
+
+
+class Storage:
+    """Storage factory with fallback support."""
+
+    def __init__(self):
+        self._backend: BaseStorage = self._init_backend()
+
+    def _init_backend(self) -> BaseStorage:
+        """Initialize storage backend based on environment."""
+        redis_host = os.getenv("REDIS_HOST")
+        redis_port = os.getenv("REDIS_PORT")
+
+        if redis_host and redis_port:
+            try:
+                return RedisStorage(
+                    host=redis_host,
+                    port=int(redis_port),
+                    password=os.getenv("REDIS_PASSWORD"),
+                    db=int(os.getenv("REDIS_DB", "0"))
+                )
+            except Exception as e:
+                logger.warning(f"Failed to init Redis, falling back to memory: {e}")
+
+        logger.info("Using in-memory storage")
+        return InMemoryStorage()
+
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return await self._backend.get(session_id)
+
+    async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
+        await self._backend.set(session_id, data, ttl)
+
+    async def delete(self, session_id: str) -> None:
+        await self._backend.delete(session_id)
+
+
+# ==================== DeepSeek Context Handler ====================
+
+class DeepSeekContextHandler(CustomLogger):
+    """
+    Handler for DeepSeek V3.2 context management.
+    
+    Implements three-hook architecture:
+    1. async_pre_call_hook: Strip reasoning from messages on new user input
+    2. async_get_chat_completion_prompt: Inject stored reasoning for tool-only turns
+    3. async_post_call_success_hook: Capture and store reasoning from responses
+    """
+
+    def __init__(self):
         super().__init__()
-        # Store reasoning content from previous turns to rebuild conversation history
-        self.conversation_history: List[Dict[str, Any]] = []
+        self.storage = Storage()
+        logger.info("🚀 DeepSeekContextHandler initialized")
 
-    # ==================== Message Type Detection ====================
+    # ==================== Utility Methods ====================
 
-    def _detect_message_type(self, message: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None, message_index: Optional[int] = None) -> str:
+    def _get_session_id(self, data: Dict[str, Any]) -> str:
+        """Extract or generate session ID from request data."""
+        session_id = data.get("litellm_session_id") or data.get("litellm_trace_id")
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            data["litellm_session_id"] = session_id
+            logger.debug(f"Generated new session ID: {session_id}")
+        return session_id
+
+    def _is_tool_result(self, message: Dict[str, Any]) -> bool:
+        """Check if message is a tool result."""
+        return message.get("role") in ["tool", "function"]
+
+    def _is_user_message(self, message: Dict[str, Any]) -> bool:
+        """Check if message is from user."""
+        return message.get("role") == "user"
+
+    def _is_assistant_message(self, message: Dict[str, Any]) -> bool:
+        """Check if message is from assistant."""
+        return message.get("role") == "assistant"
+
+    def _has_reasoning_content(self, message: Dict[str, Any]) -> bool:
+        """Check if message contains reasoning content."""
+        return bool(message.get("reasoning_content"))
+
+    def _strip_reasoning_from_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove reasoning_content from all messages."""
+        cleaned = []
+        for msg in messages:
+            msg_copy = msg.copy()
+            if "reasoning_content" in msg_copy:
+                del msg_copy["reasoning_content"]
+                logger.debug(f"Stripped reasoning from {msg.get('role')} message")
+            cleaned.append(msg_copy)
+        return cleaned
+
+    def _detect_interaction_type(self, messages: List[Dict[str, Any]]) -> str:
         """
-        Detect the type of a message based on its role and content.
-
-        Returns: "user", "assistant", "tool", "tool_instruction", or "unknown"
+        Detect the type of current interaction.
+        
+        Returns:
+            - "new_user": Last message is from user (new turn)
+            - "tool_only": Last message is tool result (continuation)
+            - "other": Unknown or assistant message
         """
-        role = message.get("role", "").lower()
+        if not messages:
+            return "other"
 
-        # OpenAI format: explicit tool/function roles
-        if role in ["tool", "function"]:
-            return "tool"
+        last_message = messages[-1]
 
-        # Check for tool instruction messages masquerading as user
-        if role == "user" and messages is not None and message_index is not None:
-            if self._is_tool_instruction_message(message, messages, message_index):
-                return "tool_instruction"
-
-        # Standard roles
-        if role == "user":
-            return "user"
-        elif role == "assistant":
-            return "assistant"
-
-        return "unknown"
-
-    # ==================== Tool Call Detection ====================
-
-    def _has_tool_calls(self, message: Dict[str, Any]) -> bool:
-        """Check if an assistant message contains tool calls (OpenAI format)."""
-        return bool(message.get("tool_calls"))
-
-    # ==================== Reasoning Extraction ====================
+        if self._is_user_message(last_message):
+            return "new_user"
+        elif self._is_tool_result(last_message):
+            return "tool_only"
+        else:
+            return "other"
 
     def _extract_reasoning_from_response(self, response: ModelResponse) -> Optional[str]:
-        """
-        Extract reasoning content from a successful ModelResponse.
-        
-        Returns: reasoning_content string or None
-        """
+        """Extract reasoning_content from model response."""
         try:
             if not isinstance(response, ModelResponse):
                 return None
-                
             if not response.choices:
                 return None
-                
+            
             message = response.choices[0].message
-            return getattr(message, 'reasoning_content', None)
+            reasoning = getattr(message, "reasoning_content", None)
+            
+            if reasoning:
+                logger.debug(f"Extracted reasoning: {len(reasoning)} chars")
+            return reasoning
             
         except Exception as e:
-            logger.warning(f"Failed to extract reasoning from response: {e}")
+            logger.warning(f"Failed to extract reasoning: {e}")
             return None
 
-    # ==================== Interaction Detection ====================
-
-    def _is_new_user_message(self, data: Dict[str, Any]) -> bool:
+    def _inject_reasoning_into_messages(
+        self, 
+        messages: List[Dict[str, Any]], 
+        reasoning: str
+    ) -> List[Dict[str, Any]]:
         """
-        Check if the current request contains a new user message.
-        This is determined by examining the request data before model generation.
+        Inject reasoning content into the last assistant message.
+        If no assistant message exists, prepend one with reasoning.
         """
-        messages = data.get("messages", [])
         if not messages:
-            return False
+            return messages
 
-        last_message = messages[-1]
-        return self._detect_message_type(last_message) == "user"
-
-    def _is_tool_only_interaction(self, data: Dict[str, Any]) -> bool:
-        """
-        Check if this is a tool-only interaction (no new user message).
-        This occurs when the last message is a tool result.
-        """
-        messages = data.get("messages", [])
-        if not messages:
-            return False
-
-        last_message = messages[-1]
-        return self._detect_message_type(last_message) == "tool"
-
-    # ==================== Tool Instruction Detection ====================
-
-    def _is_tool_instruction_message(self, message: Dict[str, Any], messages: List[Dict[str, Any]], message_index: int) -> bool:
-        """
-        Detect if a user message is actually a tool instruction masquerading as user content.
-
-        This catches edge cases like Zed Editor's edit_file tool that sends instructions
-        in user role format before actual tool calls.
-
-        Returns: True if this is a tool instruction, False otherwise
-        """
-        # Only check user messages
-        if message.get("role", "").lower() != "user":
-            return False
-
-        content = message.get("content", "")
-        if not content or not isinstance(content, str):
-            return False
-
-        content_lower = content.lower()
-
-        # Pattern matching with signature indicators
-        tool_instruction_patterns = [
-            # XML-style tool tags
-            r"<edits>",
-            r"<old_text",
-            r"<new_text>",
-            r"<file_to_edit>",
-            r"<edit_description>",
-        ]
-
-        pattern_score = 0
-        for pattern in tool_instruction_patterns:
-            if re.search(pattern, content_lower, re.IGNORECASE):
-                pattern_score += 1
-
-        # If multiple patterns match, it's likely a tool instruction
-        if pattern_score >= 2:
-            logger.info(f"🎯 Detected tool instruction message (pattern score: {pattern_score})")
-            return True
-
-        return False
-
-    # ==================== Debug Dump ====================
-
-    def _dump_raw_conversation_turn(self, data: Dict[str, Any], response: ModelResponse) -> None:
-        """
-        Dump raw conversation turns to JSON for debugging.
+        modified = [m.copy() for m in messages]
         
-        This helps identify edge cases and verify that reasoning_content is properly
-        structured in the response object.
+        # Find last assistant message
+        for i in range(len(modified) - 1, -1, -1):
+            if self._is_assistant_message(modified[i]):
+                modified[i]["reasoning_content"] = reasoning
+                logger.debug(f"Injected reasoning into assistant message at index {i}")
+                return modified
+        
+        # No assistant message found - prepend one
+        reasoning_msg = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": reasoning
+        }
+        logger.debug("Prepended reasoning message (no assistant found)")
+        return [reasoning_msg] + modified
+
+    # ==================== Hook 1: Pre-Call ====================
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        cache: Any,
+        data: Dict[str, Any],
+        call_type: str,
+    ) -> Dict[str, Any]:
+        """
+        Strip reasoning content from messages when new user input is detected.
+        
+        This runs BEFORE the LLM call, so we clean the incoming messages.
         """
         try:
-            # Create debug directory if it doesn't exist
-            debug_dir = "debug_conversation_dumps"
-            os.makedirs(debug_dir, exist_ok=True)
-
-            # Generate timestamped filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = f"{debug_dir}/conversation_{timestamp}.json"
-
-            # Prepare dump data with metadata
-            dump_data = {
-                "timestamp": datetime.now().isoformat(),
-                "request_messages_count": len(data.get("messages", [])),
-                "response_type": type(response).__name__,
-                "messages": []
-            }
-
-            # Add request messages with type detection
             messages = data.get("messages", [])
-            for idx, message in enumerate(messages):
-                message_copy = message.copy()
-                message_type = self._detect_message_type(message, messages, idx)
+            if not messages:
+                return data
+
+            interaction_type = self._detect_interaction_type(messages)
+
+            if interaction_type == "new_user":
+                logger.info("🧹 New user message detected - stripping reasoning content")
+                cleaned_messages = self._strip_reasoning_from_messages(messages)
+                data["messages"] = cleaned_messages
                 
-                message_copy["_debug"] = {
-                    "index": idx,
-                    "detected_type": message_type,
-                    "role": message.get("role", "unknown"),
-                    "has_tool_calls": self._has_tool_calls(message),
-                    "is_tool_instruction": (message_type == "tool_instruction"),
-                }
-                
-                dump_data["messages"].append(message_copy)
+                # Also clear any stored reasoning for this session
+                session_id = self._get_session_id(data)
+                await self.storage.delete(session_id)
+                logger.debug(f"Cleared stored reasoning for session {session_id}")
 
-            # Add response information
-            if isinstance(response, ModelResponse) and response.choices:
-                response_message = response.choices[0].message
-                dump_data["response"] = {
-                    "has_reasoning_content": hasattr(response_message, 'reasoning_content'),
-                    "reasoning_content": getattr(response_message, 'reasoning_content', None),
-                    "content": getattr(response_message, 'content', None),
-                    "tool_calls": getattr(response_message, 'tool_calls', None),
-                }
-
-            # Write to JSON file
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(dump_data, f, indent=2, ensure_ascii=False)
-
-            logger.info(f"🔍 Dumped conversation to: {filename}")
+            return data
 
         except Exception as e:
-            logger.error(f"Failed to dump conversation to JSON: {e}", exc_info=True)
+            logger.error(f"Error in async_pre_call_hook: {e}", exc_info=True)
+            # Fail open - return original data
+            return data
 
-    # ==================== Main Hook: async_post_call_success_hook ====================
+    # ==================== Hook 2: Get Chat Completion Prompt ====================
+
+    async def async_get_chat_completion_prompt(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        non_default_params: Dict[str, Any],
+        **kwargs
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Inject stored reasoning for tool-only interactions.
+        
+        This runs BEFORE the LLM call and can modify the messages.
+        """
+        try:
+            # Get session ID from litellm_logging_obj if available
+            litellm_logging_obj = kwargs.get("litellm_logging_obj")
+            session_id = None
+            
+            if litellm_logging_obj and hasattr(litellm_logging_obj, "litellm_params"):
+                session_id = litellm_logging_obj.litellm_params.get("litellm_session_id")
+            
+            if not session_id:
+                # Try to extract from messages metadata or generate
+                session_id = str(uuid.uuid4())
+
+            interaction_type = self._detect_interaction_type(messages)
+
+            if interaction_type == "tool_only":
+                logger.info("🔧 Tool-only interaction - checking for stored reasoning")
+                
+                stored = await self.storage.get(session_id)
+                if stored and stored.get("reasoning"):
+                    reasoning = stored["reasoning"]
+                    modified_messages = self._inject_reasoning_into_messages(messages, reasoning)
+                    logger.info(f"✅ Injected stored reasoning ({len(reasoning)} chars)")
+                    return model, modified_messages, non_default_params
+                else:
+                    logger.warning("No stored reasoning found for tool-only interaction")
+
+            return model, messages, non_default_params
+
+        except Exception as e:
+            logger.error(f"Error in async_get_chat_completion_prompt: {e}", exc_info=True)
+            # Fail open - return original
+            return model, messages, non_default_params
+
+    # ==================== Hook 3: Post-Call Success ====================
 
     async def async_post_call_success_hook(
         self,
@@ -233,77 +362,38 @@ class DeepSeekContextHandler(CustomLogger):
         response: Any,
     ) -> Any:
         """
-        Post-call hook that manages reasoning content based on interaction type.
+        Capture and store reasoning content from successful responses.
         
-        This hook runs AFTER a successful LLM API call and implements the three core rules:
-        1. Preserve reasoning during tool interactions
-        2. Discard reasoning on new user input
-        3. Always preserve tool history
-        
-        Args:
-            data: Original request payload (model, messages, params, etc.)
-            user_api_key_dict: Auth context for the calling user/API key
-            response: Raw response object from the underlying LLM provider
-            
-        Returns:
-            Modified response object with reasoning content managed according to the rules
+        This runs AFTER the LLM call, so we extract and store reasoning
+        for potential use in the next tool-only turn.
         """
         try:
-            # Only process ModelResponse objects
             if not isinstance(response, ModelResponse):
-                logger.debug("Response is not ModelResponse, skipping processing")
                 return response
 
             messages = data.get("messages", [])
-            if not messages:
-                logger.debug("No messages in request, skipping processing")
-                return response
+            session_id = self._get_session_id(data)
 
-            logger.info("Processing successful response for reasoning management")
-
-            # Dump conversation for debugging
-            self._dump_raw_conversation_turn(data, response)
-
-            # Extract reasoning from the response
-            reasoning_content = self._extract_reasoning_from_response(response)
+            # Extract reasoning from response
+            reasoning = self._extract_reasoning_from_response(response)
             
-            # Determine interaction type
-            is_new_user = self._is_new_user_message(data)
-            is_tool_only = self._is_tool_only_interaction(data)
-
-            # Apply rules based on interaction type
-            if is_new_user:
-                # Rule 2: Discard reasoning on new user input
-                logger.info("New user message detected - discarding reasoning content")
-                
-                # Remove reasoning_content from response if it exists
-                if hasattr(response.choices[0].message, 'reasoning_content'):
-                    response.choices[0].message.reasoning_content = None
-                    
-            elif is_tool_only:
-                # Rule 1: Preserve reasoning during tool interactions
-                logger.info("Tool-only interaction detected - preserving reasoning content")
-                
-                # Reasoning is already in the response, no action needed
-                if reasoning_content:
-                    logger.debug(f"Preserved reasoning content: {len(reasoning_content)} chars")
-                    
+            if reasoning:
+                # Store for next turn
+                await self.storage.set(session_id, {
+                    "reasoning": reasoning,
+                    "timestamp": str(uuid.uuid4())  # Simple timestamp placeholder
+                })
+                logger.info(f"💾 Stored reasoning for session {session_id[:8]}... ({len(reasoning)} chars)")
             else:
-                # Default: preserve everything
-                logger.debug("Default interaction - preserving all content")
-                
-            # Rule 3: Always preserve tool history is handled automatically by LiteLLM
-            # Tool calls and results remain in the conversation history
-            
-            logger.info(f"Response processed. Reasoning preserved: {is_tool_only and reasoning_content is not None}")
+                logger.debug("No reasoning content in response")
+
+            return response
 
         except Exception as e:
-            # Log error but don't break the response
             logger.error(f"Error in async_post_call_success_hook: {e}", exc_info=True)
-            logger.warning("Continuing with original response due to error")
-
-        return response
+            # Fail open - return original response
+            return response
 
 
 # Create handler instance for use in proxy_config.yaml
-interleaved_thinking = DeepSeekContextHandler()
+deepseek_context_handler = DeepSeekContextHandler()
