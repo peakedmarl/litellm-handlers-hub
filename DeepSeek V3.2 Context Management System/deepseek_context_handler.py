@@ -1,4 +1,3 @@
- ```litellm-handlers-hub/DeepSeek V3.2 Context Management System/deepseek_context_handler.py
 """
 DeepSeek V3.2 Context Handler - v3.0 (Clean Slate)
 
@@ -172,12 +171,28 @@ class DeepSeekContextHandler(CustomLogger):
         return session_id
 
     def _is_tool_result(self, message: Dict[str, Any]) -> bool:
-        """Check if message is a tool result."""
-        return message.get("role") in ["tool", "function"]
+        """Check if message is a tool result (handles OpenAI and Anthropic formats)."""
+        if message.get("role") in ["tool", "function"]:
+            return True
+
+        # Anthropic format: tool results have role 'user' and contain 'tool_result' block
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    return True
+        return False
 
     def _is_user_message(self, message: Dict[str, Any]) -> bool:
-        """Check if message is from user."""
-        return message.get("role") == "user"
+        """Check if message is from user (not a tool result)."""
+        if message.get("role") != "user":
+            return False
+
+        # If it's an Anthropic tool result, it's not a pure user message
+        if self._is_tool_result(message):
+            return False
+
+        return True
 
     def _is_assistant_message(self, message: Dict[str, Any]) -> bool:
         """Check if message is from assistant."""
@@ -188,13 +203,26 @@ class DeepSeekContextHandler(CustomLogger):
         return bool(message.get("reasoning_content"))
 
     def _strip_reasoning_from_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove reasoning_content from all messages."""
+        """Remove reasoning_content and thinking blocks from all messages."""
         cleaned = []
         for msg in messages:
             msg_copy = msg.copy()
+            # Strip top-level reasoning_content
             if "reasoning_content" in msg_copy:
                 del msg_copy["reasoning_content"]
-                logger.debug(f"Stripped reasoning from {msg.get('role')} message")
+                logger.debug(f"Stripped top-level reasoning from {msg.get('role')} message")
+
+            # Strip thinking blocks from content list (Anthropic format)
+            content = msg_copy.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") in ["thinking", "thought"]:
+                        logger.debug(f"Stripped {item.get('type')} block from content list")
+                        continue
+                    new_content.append(item)
+                msg_copy["content"] = new_content
+
             cleaned.append(msg_copy)
         return cleaned
 
