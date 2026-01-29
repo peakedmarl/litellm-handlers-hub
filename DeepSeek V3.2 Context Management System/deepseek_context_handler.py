@@ -15,9 +15,10 @@ import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.utils import ModelResponseStream
 from litellm.proxy.proxy_server import UserAPIKeyAuth
 from litellm.types.utils import ModelResponse
 
@@ -147,7 +148,7 @@ class Storage:
 class DeepSeekContextHandler(CustomLogger):
     """
     Handler for DeepSeek V3.2 context management.
-    
+
     Implements three-hook architecture:
     1. async_pre_call_hook: Strip reasoning from messages on new user input
     2. async_get_chat_completion_prompt: Inject stored reasoning for tool-only turns
@@ -229,7 +230,7 @@ class DeepSeekContextHandler(CustomLogger):
     def _detect_interaction_type(self, messages: List[Dict[str, Any]]) -> str:
         """
         Detect the type of current interaction.
-        
+
         Returns:
             - "new_user": Last message is from user (new turn)
             - "tool_only": Last message is tool result (continuation)
@@ -254,21 +255,45 @@ class DeepSeekContextHandler(CustomLogger):
                 return None
             if not response.choices:
                 return None
-            
+
             message = response.choices[0].message
             reasoning = getattr(message, "reasoning_content", None)
-            
+
             if reasoning:
                 logger.debug(f"Extracted reasoning: {len(reasoning)} chars")
             return reasoning
-            
+
         except Exception as e:
             logger.warning(f"Failed to extract reasoning: {e}")
             return None
 
+    def _chunk_has_reasoning(self, chunk: ModelResponseStream) -> bool:
+        """Check if a streaming chunk contains reasoning content."""
+        try:
+            if not chunk.choices:
+                return False
+            delta = chunk.choices[0].delta
+            return hasattr(delta, "reasoning_content") and delta.reasoning_content is not None
+        except Exception:
+            return False
+
+    def _extract_reasoning_from_chunk(self, chunk: ModelResponseStream) -> Optional[str]:
+        """Extract reasoning_content from a streaming chunk."""
+        try:
+            if not chunk.choices:
+                return None
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                return str(reasoning)
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to extract reasoning from chunk: {e}")
+            return None
+
     def _inject_reasoning_into_messages(
-        self, 
-        messages: List[Dict[str, Any]], 
+        self,
+        messages: List[Dict[str, Any]],
         reasoning: str
     ) -> List[Dict[str, Any]]:
         """
@@ -279,14 +304,14 @@ class DeepSeekContextHandler(CustomLogger):
             return messages
 
         modified = [m.copy() for m in messages]
-        
+
         # Find last assistant message
         for i in range(len(modified) - 1, -1, -1):
             if self._is_assistant_message(modified[i]):
                 modified[i]["reasoning_content"] = reasoning
                 logger.debug(f"Injected reasoning into assistant message at index {i}")
                 return modified
-        
+
         # No assistant message found - prepend one
         reasoning_msg = {
             "role": "assistant",
@@ -307,7 +332,7 @@ class DeepSeekContextHandler(CustomLogger):
     ) -> Dict[str, Any]:
         """
         Strip reasoning content from messages when new user input is detected.
-        
+
         This runs BEFORE the LLM call, so we clean the incoming messages.
         """
         try:
@@ -321,7 +346,7 @@ class DeepSeekContextHandler(CustomLogger):
                 logger.info("🧹 New user message detected - stripping reasoning content")
                 cleaned_messages = self._strip_reasoning_from_messages(messages)
                 data["messages"] = cleaned_messages
-                
+
                 # Also clear any stored reasoning for this session
                 session_id = self._get_session_id(data)
                 await self.storage.delete(session_id)
@@ -345,17 +370,17 @@ class DeepSeekContextHandler(CustomLogger):
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """
         Inject stored reasoning for tool-only interactions.
-        
+
         This runs BEFORE the LLM call and can modify the messages.
         """
         try:
             # Get session ID from litellm_logging_obj if available
             litellm_logging_obj = kwargs.get("litellm_logging_obj")
             session_id = None
-            
+
             if litellm_logging_obj and hasattr(litellm_logging_obj, "litellm_params"):
                 session_id = litellm_logging_obj.litellm_params.get("litellm_session_id")
-            
+
             if not session_id:
                 # Try to extract from messages metadata or generate
                 session_id = str(uuid.uuid4())
@@ -364,7 +389,7 @@ class DeepSeekContextHandler(CustomLogger):
 
             if interaction_type == "tool_only":
                 logger.info("🔧 Tool-only interaction - checking for stored reasoning")
-                
+
                 stored = await self.storage.get(session_id)
                 if stored and stored.get("reasoning"):
                     reasoning = stored["reasoning"]
@@ -381,7 +406,7 @@ class DeepSeekContextHandler(CustomLogger):
             # Fail open - return original
             return model, messages, non_default_params
 
-    # ==================== Hook 3: Post-Call Success ====================
+    # ==================== Hook 3: Post-Call Success (Non-Streaming) ====================
 
     async def async_post_call_success_hook(
         self,
@@ -391,7 +416,7 @@ class DeepSeekContextHandler(CustomLogger):
     ) -> Any:
         """
         Capture and store reasoning content from successful responses.
-        
+
         This runs AFTER the LLM call, so we extract and store reasoning
         for potential use in the next tool-only turn.
         """
@@ -404,7 +429,7 @@ class DeepSeekContextHandler(CustomLogger):
 
             # Extract reasoning from response
             reasoning = self._extract_reasoning_from_response(response)
-            
+
             if reasoning:
                 # Store for next turn
                 await self.storage.set(session_id, {
@@ -422,6 +447,60 @@ class DeepSeekContextHandler(CustomLogger):
             # Fail open - return original response
             return response
 
+    # ==================== Hook 4: Post-Call Streaming Iterator ====================
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: AsyncGenerator[ModelResponseStream, None],
+        request_data: Dict[str, Any],
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """
+        Capture and store reasoning content from streaming responses.
+
+        Wraps the entire stream to accumulate reasoning chunks and store
+        them once the stream completes. This ensures we capture DeepSeek's
+        reasoning content without breaking the streaming flow.
+        """
+        session_id = None
+        reasoning_buffer: List[str] = []
+
+        try:
+            # Extract session ID from request data
+            session_id = request_data.get("litellm_session_id") or request_data.get("litellm_trace_id")
+            if not session_id:
+                session_id = str(uuid.uuid4())
+
+            async for chunk in response:
+                # Extract reasoning from this chunk if present
+                if self._chunk_has_reasoning(chunk):
+                    reasoning_piece = self._extract_reasoning_from_chunk(chunk)
+                    if reasoning_piece:
+                        reasoning_buffer.append(reasoning_piece)
+                        logger.debug(f"Accumulated reasoning chunk: {len(reasoning_piece)} chars")
+
+                # Yield chunk unchanged - don't break the flow!
+                yield chunk
+
+        except Exception as e:
+            logger.error(f"Error in streaming iterator hook: {e}", exc_info=True)
+            # Re-raise to not swallow errors, but ensure we still try to store reasoning
+            raise
+
+        finally:
+            # Stream ended - store accumulated reasoning if we have any
+            if reasoning_buffer and session_id:
+                try:
+                    full_reasoning = "".join(reasoning_buffer)
+                    await self.storage.set(session_id, {
+                        "reasoning": full_reasoning,
+                        "timestamp": str(uuid.uuid4()),
+                        "source": "streaming"
+                    })
+                    logger.info(f"💾 Stored streaming reasoning for session {session_id[:8]}... ({len(full_reasoning)} chars)")
+                except Exception as e:
+                    logger.error(f"Failed to store streaming reasoning: {e}")
+
 
 # Create handler instance for use in proxy_config.yaml
-deepseek_context_handler = DeepSeekContextHandler()
+interleaved_thinking = DeepSeekContextHandler()
