@@ -1,13 +1,18 @@
 """
-DeepSeek V3.2 Context Handler - v3.0 (Clean Slate)
+DeepSeek V3.2 Context Handler - v4.0 (Refactored)
 
-Proper three-hook architecture for DeepSeek V3.2 reasoning content management.
+Consolidated two-hook architecture for DeepSeek V3.2 reasoning content management.
 Uses session-based storage with Redis primary and in-memory fallback.
 
 Core Rules:
-1. Strip reasoning on new user input (async_pre_call_hook)
-2. Inject stored reasoning for tool-only turns (async_get_chat_completion_prompt)
-3. Capture and store reasoning from responses (async_post_call_success_hook)
+1. async_pre_call_hook:
+   - Strip reasoning from messages on new user input
+   - Inject stored reasoning for tool-only turns
+2. async_post_call_success_hook: Capture and store reasoning from non-streaming responses
+3. async_post_call_streaming_iterator_hook: Capture and store reasoning from streaming responses
+
+Note: async_get_chat_completion_prompt removed - it's a Prompt Management hook that
+requires prompt_id to trigger. All pre-call logic now lives in async_pre_call_hook.
 """
 
 import json
@@ -149,16 +154,16 @@ class DeepSeekContextHandler(CustomLogger):
     """
     Handler for DeepSeek V3.2 context management.
 
-    Implements three-hook architecture:
-    1. async_pre_call_hook: Strip reasoning from messages on new user input
-    2. async_get_chat_completion_prompt: Inject stored reasoning for tool-only turns
-    3. async_post_call_success_hook: Capture and store reasoning from responses
+    Implements consolidated two-hook architecture:
+    1. async_pre_call_hook: Handle ALL pre-call logic (strip on new user, inject on tool-only)
+    2. async_post_call_success_hook: Capture and store reasoning from non-streaming responses
+    3. async_post_call_streaming_iterator_hook: Capture and store reasoning from streaming responses
     """
 
     def __init__(self):
         super().__init__()
         self.storage = Storage()
-        logger.info("🚀 DeepSeekContextHandler initialized")
+        logger.info("🚀 DeepSeekContextHandler initialized (v4.0 - Refactored)")
 
     # ==================== Utility Methods ====================
 
@@ -321,7 +326,7 @@ class DeepSeekContextHandler(CustomLogger):
         logger.debug("Prepended reasoning message (no assistant found)")
         return [reasoning_msg] + modified
 
-    # ==================== Hook 1: Pre-Call ====================
+    # ==================== Hook 1: Pre-Call (Consolidated) ====================
 
     async def async_pre_call_hook(
         self,
@@ -331,9 +336,11 @@ class DeepSeekContextHandler(CustomLogger):
         call_type: str,
     ) -> Dict[str, Any]:
         """
-        Strip reasoning content from messages when new user input is detected.
+        Handle ALL pre-call logic for reasoning content management.
 
-        This runs BEFORE the LLM call, so we clean the incoming messages.
+        This runs BEFORE the LLM call and handles:
+        - New user input: Strip any existing reasoning, clear stored reasoning
+        - Tool-only turns: Inject stored reasoning from previous response
         """
         try:
             messages = data.get("messages", [])
@@ -341,16 +348,28 @@ class DeepSeekContextHandler(CustomLogger):
                 return data
 
             interaction_type = self._detect_interaction_type(messages)
+            session_id = self._get_session_id(data)
 
             if interaction_type == "new_user":
                 logger.info("🧹 New user message detected - stripping reasoning content")
                 cleaned_messages = self._strip_reasoning_from_messages(messages)
                 data["messages"] = cleaned_messages
 
-                # Also clear any stored reasoning for this session
-                session_id = self._get_session_id(data)
+                # Clear any stored reasoning for this session (fresh turn)
                 await self.storage.delete(session_id)
                 logger.debug(f"Cleared stored reasoning for session {session_id}")
+
+            elif interaction_type == "tool_only":
+                logger.info("🔧 Tool-only interaction - checking for stored reasoning")
+
+                stored = await self.storage.get(session_id)
+                if stored and stored.get("reasoning"):
+                    reasoning = stored["reasoning"]
+                    modified_messages = self._inject_reasoning_into_messages(messages, reasoning)
+                    data["messages"] = modified_messages
+                    logger.info(f"✅ Injected stored reasoning ({len(reasoning)} chars) into tool-only turn")
+                else:
+                    logger.warning("⚠️ No stored reasoning found for tool-only interaction")
 
             return data
 
@@ -359,54 +378,7 @@ class DeepSeekContextHandler(CustomLogger):
             # Fail open - return original data
             return data
 
-    # ==================== Hook 2: Get Chat Completion Prompt ====================
-
-    async def async_get_chat_completion_prompt(
-        self,
-        model: str,
-        messages: List[Dict[str, Any]],
-        non_default_params: Dict[str, Any],
-        **kwargs
-    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-        """
-        Inject stored reasoning for tool-only interactions.
-
-        This runs BEFORE the LLM call and can modify the messages.
-        """
-        try:
-            # Get session ID from litellm_logging_obj if available
-            litellm_logging_obj = kwargs.get("litellm_logging_obj")
-            session_id = None
-
-            if litellm_logging_obj and hasattr(litellm_logging_obj, "litellm_params"):
-                session_id = litellm_logging_obj.litellm_params.get("litellm_session_id")
-
-            if not session_id:
-                # Try to extract from messages metadata or generate
-                session_id = str(uuid.uuid4())
-
-            interaction_type = self._detect_interaction_type(messages)
-
-            if interaction_type == "tool_only":
-                logger.info("🔧 Tool-only interaction - checking for stored reasoning")
-
-                stored = await self.storage.get(session_id)
-                if stored and stored.get("reasoning"):
-                    reasoning = stored["reasoning"]
-                    modified_messages = self._inject_reasoning_into_messages(messages, reasoning)
-                    logger.info(f"✅ Injected stored reasoning ({len(reasoning)} chars)")
-                    return model, modified_messages, non_default_params
-                else:
-                    logger.warning("No stored reasoning found for tool-only interaction")
-
-            return model, messages, non_default_params
-
-        except Exception as e:
-            logger.error(f"Error in async_get_chat_completion_prompt: {e}", exc_info=True)
-            # Fail open - return original
-            return model, messages, non_default_params
-
-    # ==================== Hook 3: Post-Call Success (Non-Streaming) ====================
+    # ==================== Hook 2: Post-Call Success (Non-Streaming) ====================
 
     async def async_post_call_success_hook(
         self,
@@ -447,7 +419,7 @@ class DeepSeekContextHandler(CustomLogger):
             # Fail open - return original response
             return response
 
-    # ==================== Hook 4: Post-Call Streaming Iterator ====================
+    # ==================== Hook 3: Post-Call Streaming Iterator ====================
 
     async def async_post_call_streaming_iterator_hook(
         self,
