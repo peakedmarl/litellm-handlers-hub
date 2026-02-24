@@ -1,8 +1,12 @@
 """
-DeepSeek V3.2 Context Handler - v4.0 (Refactored)
+DeepSeek V3.2 Context Handler - v4.1 (Clean)
 
 Consolidated two-hook architecture for DeepSeek V3.2 reasoning content management.
 Uses session-based storage with Redis primary and in-memory fallback.
+
+Session Management:
+- Session ID is attached to user_api_key_dict (shared across all hooks)
+- Guaranteed consistency between pre-call and post-call hooks
 
 Core Rules:
 1. async_pre_call_hook:
@@ -167,19 +171,17 @@ class DeepSeekContextHandler(CustomLogger):
 
     # ==================== Utility Methods ====================
 
-    def _get_session_id(self, data: Dict[str, Any]) -> str:
-        """Extract session ID from request data using litellm_call_id for consistency."""
-        # litellm_call_id is consistent across ALL hooks for a single request
-        call_id = data.get("litellm_call_id")
-        if call_id:
-            return call_id
+    def _get_session_id(self, user_api_key_dict: UserAPIKeyAuth) -> str:
+        """Get or create session ID attached to the shared user_api_key_dict."""
+        # Check if we already have a session ID attached
+        session_id = getattr(user_api_key_dict, "_deepseek_session_id", None)
         
-        # Fallback to session/trace IDs (shouldn't happen in normal flow)
-        session_id = data.get("litellm_session_id") or data.get("litellm_trace_id")
         if not session_id:
+            # Generate new session ID and attach it
             session_id = str(uuid.uuid4())
-            data["litellm_session_id"] = session_id
-            logger.debug(f"Generated new session ID: {session_id}")
+            user_api_key_dict._deepseek_session_id = session_id
+            logger.debug(f"Created new session ID: {session_id[:8]}...")
+        
         return session_id
 
     def _is_tool_result(self, message: Dict[str, Any]) -> bool:
@@ -354,7 +356,7 @@ class DeepSeekContextHandler(CustomLogger):
                 return data
 
             interaction_type = self._detect_interaction_type(messages)
-            session_id = self._get_session_id(data)
+            session_id = self._get_session_id(user_api_key_dict)
 
             if interaction_type == "new_user":
                 logger.info("🧹 New user message detected - stripping reasoning content")
@@ -403,7 +405,7 @@ class DeepSeekContextHandler(CustomLogger):
                 return response
 
             messages = data.get("messages", [])
-            session_id = self._get_session_id(data)
+            session_id = self._get_session_id(user_api_key_dict)
 
             # Extract reasoning from response
             reasoning = self._extract_reasoning_from_response(response)
@@ -436,21 +438,13 @@ class DeepSeekContextHandler(CustomLogger):
         """
         Capture and store reasoning content from streaming responses.
 
-        Wraps the entire stream to accumulate reasoning chunks and store
-        them once the stream completes. This ensures we capture DeepSeek's
-        reasoning content without breaking the streaming flow.
+        Uses user_api_key_dict as the shared state for session ID consistency
+        with pre-call hook. Wraps the stream to accumulate reasoning chunks
+        and stores them once the stream completes.
         """
         reasoning_buffer: List[str] = []
 
-        # Extract session ID using litellm_call_id for consistency with pre-call hook
-        # litellm_call_id is guaranteed to be the same across all hooks
-        session_id = (
-            request_data.get("litellm_call_id")  # Primary: consistent across hooks
-            or getattr(user_api_key_dict, "litellm_call_id", None)  # Fallback
-            or request_data.get("litellm_session_id")
-            or request_data.get("litellm_trace_id")
-            or str(uuid.uuid4())  # Last resort
-        )
+        session_id = self._get_session_id(user_api_key_dict)
 
         try:
 

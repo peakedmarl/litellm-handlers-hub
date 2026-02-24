@@ -57,3 +57,9 @@ htmlcov/
 *.tmp
 *.bak
 *.cache
+
+# Obisidian like Files
+Files
+.obsidian
+Project Structure.md
+prompt.md
