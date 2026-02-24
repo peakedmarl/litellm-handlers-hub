@@ -168,7 +168,13 @@ class DeepSeekContextHandler(CustomLogger):
     # ==================== Utility Methods ====================
 
     def _get_session_id(self, data: Dict[str, Any]) -> str:
-        """Extract or generate session ID from request data."""
+        """Extract session ID from request data using litellm_call_id for consistency."""
+        # litellm_call_id is consistent across ALL hooks for a single request
+        call_id = data.get("litellm_call_id")
+        if call_id:
+            return call_id
+        
+        # Fallback to session/trace IDs (shouldn't happen in normal flow)
         session_id = data.get("litellm_session_id") or data.get("litellm_trace_id")
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -434,14 +440,19 @@ class DeepSeekContextHandler(CustomLogger):
         them once the stream completes. This ensures we capture DeepSeek's
         reasoning content without breaking the streaming flow.
         """
-        session_id = None
         reasoning_buffer: List[str] = []
 
+        # Extract session ID using litellm_call_id for consistency with pre-call hook
+        # litellm_call_id is guaranteed to be the same across all hooks
+        session_id = (
+            request_data.get("litellm_call_id")  # Primary: consistent across hooks
+            or getattr(user_api_key_dict, "litellm_call_id", None)  # Fallback
+            or request_data.get("litellm_session_id")
+            or request_data.get("litellm_trace_id")
+            or str(uuid.uuid4())  # Last resort
+        )
+
         try:
-            # Extract session ID from request data
-            session_id = request_data.get("litellm_session_id") or request_data.get("litellm_trace_id")
-            if not session_id:
-                session_id = str(uuid.uuid4())
 
             async for chunk in response:
                 # Extract reasoning from this chunk if present
