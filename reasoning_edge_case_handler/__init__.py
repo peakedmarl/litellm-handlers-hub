@@ -174,14 +174,23 @@ class ReasoningEdgeCaseHandler(CustomLogger):
                 # Create a synthetic stream chunk with the follow-up content
                 # We use the last chunk as a template and inject the new content
                 if chunks:
-                    template_chunk = chunks[-1]
-                    # Create a new chunk with the follow-up content
-                    # This preserves the streaming interface
-                    from litellm.types.utils import Delta
+                    import copy
 
-                    new_delta = Delta(content=content)
-                    template_chunk.choices[0].delta = new_delta
-                    yield template_chunk
+                    # Find the last chunk that has choices, or fallback to the last chunk
+                    template_chunk = None
+                    for c in reversed(chunks):
+                        if getattr(c, "choices", None):
+                            template_chunk = copy.deepcopy(c)
+                            break
+
+                    if template_chunk and template_chunk.choices:
+                        # Create a new chunk with the follow-up content
+                        # This preserves the streaming interface
+                        from litellm.types.utils import Delta
+
+                        new_delta = Delta(content=content)
+                        template_chunk.choices[0].delta = new_delta
+                        yield template_chunk
 
         except Exception as e:
             # If follow-up fails, we've already yielded the original chunks
