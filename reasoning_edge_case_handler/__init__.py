@@ -94,7 +94,6 @@ class ReasoningEdgeCaseHandler(CustomLogger):
         chunks = []
         has_reasoning = False
         has_content = False
-        reasoning_content_parts = []
 
         # Phase 1: Consume stream, yield chunks, analyze content
         async for chunk in response:
@@ -108,7 +107,6 @@ class ReasoningEdgeCaseHandler(CustomLogger):
                 reasoning_piece = getattr(delta, "reasoning_content", None)
                 if reasoning_piece:
                     has_reasoning = True
-                    reasoning_content_parts.append(reasoning_piece)
 
                 # Check for content
                 content_piece = getattr(delta, "content", None)
@@ -128,17 +126,10 @@ class ReasoningEdgeCaseHandler(CustomLogger):
         metadata = request_data.get("metadata", {})
         metadata["_reasoning_retry_count"] = 1
 
-        # Build the full reasoning content from collected parts
-        reasoning = "".join(reasoning_content_parts)
-
         # Build follow-up messages with the nudge
         original_messages = request_data.get("messages", [])
 
         follow_up_messages = original_messages + [
-            {
-                "role": "assistant",
-                "content": f"<thinking>{reasoning}</thinking>"
-            },
             {
                 "role": "user",
                 "content": "Go ahead!"
