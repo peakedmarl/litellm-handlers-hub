@@ -22,6 +22,7 @@ requires prompt_id to trigger. All pre-call logic now lives in async_pre_call_ho
 import json
 import logging
 import os
+import hashlib
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -172,17 +173,15 @@ class DeepSeekContextHandler(CustomLogger):
     # ==================== Utility Methods ====================
 
     def _get_session_id(self, user_api_key_dict: UserAPIKeyAuth) -> str:
-        """Get or create session ID attached to the shared user_api_key_dict."""
-        # Check if we already have a session ID attached
-        session_id = getattr(user_api_key_dict, "_deepseek_session_id", None)
-        
-        if not session_id:
-            # Generate new session ID and attach it
-            session_id = str(uuid.uuid4())
-            user_api_key_dict._deepseek_session_id = session_id
-            logger.debug(f"Created new session ID: {session_id[:8]}...")
-        
-        return session_id
+        """Get stable session ID from user API key token."""
+        # Use token as session ID - persists across turns unlike the dict object
+        token = getattr(user_api_key_dict, "token", None)
+
+        if token:
+            # Hash the token for security (don't store raw API key)
+            session_id = hashlib.sha256(token.encode()).hexdigest()[:16]
+            logger.debug(f"Using token-based session: {session_id[:8]}...")
+            return session_id
 
     def _is_tool_result(self, message: Dict[str, Any]) -> bool:
         """Check if message is a tool result (handles OpenAI and Anthropic formats)."""
