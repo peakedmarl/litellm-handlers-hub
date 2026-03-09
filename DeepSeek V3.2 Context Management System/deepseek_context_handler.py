@@ -1,40 +1,49 @@
 """
-DeepSeek V3.2 Context Handler - v4.1 (Clean)
+DeepSeek V3.2 Context Handler - v5.0 (Reasoning Chain)
 
-Consolidated two-hook architecture for DeepSeek V3.2 reasoning content management.
-Uses session-based storage with Redis primary and in-memory fallback.
+Implements reasoning chain persistence for multi-turn tool use conversations.
+Maintains up to 10 turns of reasoning history, injecting full chain on tool-only turns.
 
 Session Management:
-- Session ID is attached to user_api_key_dict (shared across all hooks)
-- Guaranteed consistency between pre-call and post-call hooks
+- Token-based session ID (SHA256 hash of API key token)
+- Reasoning chain stored as FIFO list (max 10 entries)
+- Cleared on fresh user messages
 
 Core Rules:
 1. async_pre_call_hook:
-   - Strip reasoning from messages on new user input
-   - Inject stored reasoning for tool-only turns
-2. async_post_call_success_hook: Capture and store reasoning from non-streaming responses
-3. async_post_call_streaming_iterator_hook: Capture and store reasoning from streaming responses
+   - New user input: Strip reasoning, clear chain
+   - Tool-only turns: Inject full reasoning chain into last assistant message
+2. async_post_call_success_hook: Append reasoning entry to chain (non-streaming)
+3. async_post_call_streaming_iterator_hook: Append reasoning entry to chain (streaming)
 
-Note: async_get_chat_completion_prompt removed - it's a Prompt Management hook that
-requires prompt_id to trigger. All pre-call logic now lives in async_pre_call_hook.
+Reasoning Chain Entry:
+{
+    "turn_index": int,           # Position in conversation
+    "reasoning": str,            # Reasoning content
+    "has_tool_calls": bool,      # Did this turn invoke tools?
+    "stored_at": str             # ISO timestamp
+}
 """
 
 import json
 import logging
 import os
 import hashlib
-import uuid
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.types.utils import ModelResponseStream
 from litellm.proxy.proxy_server import UserAPIKeyAuth
-from litellm.types.utils import ModelResponse
+from litellm.types.utils import ModelResponse, ModelResponseStream
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Constants
+MAX_CHAIN_LENGTH = 10
+REASONING_SESSION_TTL = 3600  # 1 hour
 
 
 # ==================== Storage Abstraction ====================
@@ -44,17 +53,17 @@ class BaseStorage(ABC):
 
     @abstractmethod
     async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve stored reasoning for a session."""
+        """Retrieve stored data for a session."""
         pass
 
     @abstractmethod
     async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
-        """Store reasoning for a session with TTL."""
+        """Store data for a session with TTL."""
         pass
 
     @abstractmethod
     async def delete(self, session_id: str) -> None:
-        """Delete stored reasoning for a session."""
+        """Delete stored data for a session."""
         pass
 
 
@@ -68,7 +77,6 @@ class InMemoryStorage(BaseStorage):
         return self._store.get(session_id)
 
     async def set(self, session_id: str, data: Dict[str, Any], ttl: int = 3600) -> None:
-        # TTL is ignored in memory, but we store it for compatibility
         data["_ttl"] = ttl
         self._store[session_id] = data
 
@@ -152,43 +160,69 @@ class Storage:
     async def delete(self, session_id: str) -> None:
         await self._backend.delete(session_id)
 
+    async def append_to_chain(
+        self,
+        session_id: str,
+        entry: Dict[str, Any],
+        max_length: int = MAX_CHAIN_LENGTH
+    ) -> None:
+        """
+        Append entry to reasoning chain, maintaining FIFO with max_length.
+        Creates new chain if none exists.
+        """
+        try:
+            stored = await self.get(session_id) or {}
+            chain = stored.get("reasoning_chain", [])
+
+            # Append new entry
+            chain.append(entry)
+
+            # Trim to max length (FIFO)
+            if len(chain) > max_length:
+                chain = chain[-max_length:]
+
+            # Update stored data
+            stored["reasoning_chain"] = chain
+            stored["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+            await self.set(session_id, stored, REASONING_SESSION_TTL)
+            logger.debug(f"Appended entry to chain for {session_id[:8]}... (len={len(chain)})")
+
+        except Exception as e:
+            logger.error(f"Failed to append to chain: {e}")
+
 
 # ==================== DeepSeek Context Handler ====================
 
 class DeepSeekContextHandler(CustomLogger):
     """
-    Handler for DeepSeek V3.2 context management.
+    Handler for DeepSeek V3.2 reasoning chain management.
 
-    Implements consolidated two-hook architecture:
-    1. async_pre_call_hook: Handle ALL pre-call logic (strip on new user, inject on tool-only)
-    2. async_post_call_success_hook: Capture and store reasoning from non-streaming responses
-    3. async_post_call_streaming_iterator_hook: Capture and store reasoning from streaming responses
+    Maintains up to 10 turns of reasoning history, injecting full chain
+    on tool-only turns so the model sees its complete thought process.
     """
 
     def __init__(self):
         super().__init__()
         self.storage = Storage()
-        logger.info("🚀 DeepSeekContextHandler initialized (v4.0 - Refactored)")
+        logger.info(f"🚀 DeepSeekContextHandler initialized (v5.0 - Reasoning Chain)")
 
     # ==================== Utility Methods ====================
 
-    def _get_session_id(self, user_api_key_dict: UserAPIKeyAuth) -> str:
+    def _get_session_id(self, user_api_key_dict: UserAPIKeyAuth) -> Optional[str]:
         """Get stable session ID from user API key token."""
-        # Use token as session ID - persists across turns unlike the dict object
         token = getattr(user_api_key_dict, "token", None)
-
         if token:
-            # Hash the token for security (don't store raw API key)
             session_id = hashlib.sha256(token.encode()).hexdigest()[:16]
-            logger.debug(f"Using token-based session: {session_id[:8]}...")
+            logger.debug(f"Session ID: {session_id[:8]}...")
             return session_id
+        return None
 
     def _is_tool_result(self, message: Dict[str, Any]) -> bool:
         """Check if message is a tool result (handles OpenAI and Anthropic formats)."""
         if message.get("role") in ["tool", "function"]:
             return True
 
-        # Anthropic format: tool results have role 'user' and contain 'tool_result' block
         content = message.get("content")
         if isinstance(content, list):
             for item in content:
@@ -200,44 +234,11 @@ class DeepSeekContextHandler(CustomLogger):
         """Check if message is from user (not a tool result)."""
         if message.get("role") != "user":
             return False
-
-        # If it's an Anthropic tool result, it's not a pure user message
-        if self._is_tool_result(message):
-            return False
-
-        return True
+        return not self._is_tool_result(message)
 
     def _is_assistant_message(self, message: Dict[str, Any]) -> bool:
         """Check if message is from assistant."""
         return message.get("role") == "assistant"
-
-    def _has_reasoning_content(self, message: Dict[str, Any]) -> bool:
-        """Check if message contains reasoning content."""
-        return bool(message.get("reasoning_content"))
-
-    def _strip_reasoning_from_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove reasoning_content and thinking blocks from all messages."""
-        cleaned = []
-        for msg in messages:
-            msg_copy = msg.copy()
-            # Strip top-level reasoning_content
-            if "reasoning_content" in msg_copy:
-                del msg_copy["reasoning_content"]
-                logger.debug(f"Stripped top-level reasoning from {msg.get('role')} message")
-
-            # Strip thinking blocks from content list (Anthropic format)
-            content = msg_copy.get("content")
-            if isinstance(content, list):
-                new_content = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") in ["thinking", "thought"]:
-                        logger.debug(f"Stripped {item.get('type')} block from content list")
-                        continue
-                    new_content.append(item)
-                msg_copy["content"] = new_content
-
-            cleaned.append(msg_copy)
-        return cleaned
 
     def _detect_interaction_type(self, messages: List[Dict[str, Any]]) -> str:
         """
@@ -260,12 +261,84 @@ class DeepSeekContextHandler(CustomLogger):
         else:
             return "other"
 
+    def _count_assistant_turns(self, messages: List[Dict[str, Any]]) -> int:
+        """Count number of assistant messages (used for turn indexing)."""
+        return sum(1 for msg in messages if self._is_assistant_message(msg))
+
+    def _strip_reasoning_from_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove reasoning_content and thinking blocks from all messages."""
+        cleaned = []
+        for msg in messages:
+            msg_copy = msg.copy()
+
+            # Strip top-level reasoning_content
+            if "reasoning_content" in msg_copy:
+                del msg_copy["reasoning_content"]
+                logger.debug(f"Stripped reasoning from {msg.get('role')} message")
+
+            # Strip thinking blocks from content list (Anthropic format)
+            content = msg_copy.get("content")
+            if isinstance(content, list):
+                new_content = [
+                    item for item in content
+                    if not (isinstance(item, dict) and item.get("type") in ["thinking", "thought"])
+                ]
+                msg_copy["content"] = new_content
+
+            cleaned.append(msg_copy)
+        return cleaned
+
+    def _format_reasoning_chain(self, chain: List[Dict[str, Any]]) -> str:
+        """Format reasoning chain entries into concatenated string."""
+        if not chain:
+            return ""
+
+        parts = []
+        for entry in chain:
+            turn_num = entry.get("turn_index", 0) + 1
+            reasoning = entry.get("reasoning", "")
+            has_tools = entry.get("has_tool_calls", False)
+            tool_indicator = " [tools]" if has_tools else ""
+
+            parts.append(f"[Turn {turn_num}{tool_indicator}]\n{reasoning}")
+
+        return "\n\n---\n\n".join(parts)
+
+    def _inject_reasoning_chain(
+        self,
+        messages: List[Dict[str, Any]],
+        reasoning_chain: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Inject formatted reasoning chain into the last assistant message.
+        If no assistant message exists, prepend one with reasoning.
+        """
+        if not messages or not reasoning_chain:
+            return messages
+
+        formatted_reasoning = self._format_reasoning_chain(reasoning_chain)
+        modified = [m.copy() for m in messages]
+
+        # Find last assistant message
+        for i in range(len(modified) - 1, -1, -1):
+            if self._is_assistant_message(modified[i]):
+                modified[i]["reasoning_content"] = formatted_reasoning
+                logger.debug(f"Injected reasoning chain ({len(reasoning_chain)} entries) at index {i}")
+                return modified
+
+        # No assistant message found - prepend one
+        reasoning_msg = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": formatted_reasoning
+        }
+        logger.debug("Prepended reasoning message with chain")
+        return [reasoning_msg] + modified
+
     def _extract_reasoning_from_response(self, response: ModelResponse) -> Optional[str]:
         """Extract reasoning_content from model response."""
         try:
-            if not isinstance(response, ModelResponse):
-                return None
-            if not response.choices:
+            if not isinstance(response, ModelResponse) or not response.choices:
                 return None
 
             message = response.choices[0].message
@@ -279,13 +352,16 @@ class DeepSeekContextHandler(CustomLogger):
             logger.warning(f"Failed to extract reasoning: {e}")
             return None
 
-    def _chunk_has_reasoning(self, chunk: ModelResponseStream) -> bool:
-        """Check if a streaming chunk contains reasoning content."""
+    def _detect_tool_calls_in_response(self, response: ModelResponse) -> bool:
+        """Check if response contained tool calls."""
         try:
-            if not chunk.choices:
+            if not isinstance(response, ModelResponse) or not response.choices:
                 return False
-            delta = chunk.choices[0].delta
-            return hasattr(delta, "reasoning_content") and delta.reasoning_content is not None
+
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None)
+            return bool(tool_calls and len(tool_calls) > 0)
+
         except Exception:
             return False
 
@@ -294,46 +370,28 @@ class DeepSeekContextHandler(CustomLogger):
         try:
             if not chunk.choices:
                 return None
+
             delta = chunk.choices[0].delta
             reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                return str(reasoning)
-            return None
+            return str(reasoning) if reasoning else None
+
         except Exception as e:
             logger.debug(f"Failed to extract reasoning from chunk: {e}")
             return None
 
-    def _inject_reasoning_into_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        reasoning: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Inject reasoning content into the last assistant message.
-        If no assistant message exists, prepend one with reasoning.
-        """
-        if not messages:
-            return messages
+    def _chunk_has_reasoning(self, chunk: ModelResponseStream) -> bool:
+        """Check if a streaming chunk contains reasoning content."""
+        try:
+            if not chunk.choices:
+                return False
 
-        modified = [m.copy() for m in messages]
+            delta = chunk.choices[0].delta
+            return hasattr(delta, "reasoning_content") and delta.reasoning_content is not None
 
-        # Find last assistant message
-        for i in range(len(modified) - 1, -1, -1):
-            if self._is_assistant_message(modified[i]):
-                modified[i]["reasoning_content"] = reasoning
-                logger.debug(f"Injected reasoning into assistant message at index {i}")
-                return modified
+        except Exception:
+            return False
 
-        # No assistant message found - prepend one
-        reasoning_msg = {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": reasoning
-        }
-        logger.debug("Prepended reasoning message (no assistant found)")
-        return [reasoning_msg] + modified
-
-    # ==================== Hook 1: Pre-Call (Consolidated) ====================
+    # ==================== Hook 1: Pre-Call ====================
 
     async def async_pre_call_hook(
         self,
@@ -343,11 +401,10 @@ class DeepSeekContextHandler(CustomLogger):
         call_type: str,
     ) -> Dict[str, Any]:
         """
-        Handle ALL pre-call logic for reasoning content management.
+        Handle pre-call logic for reasoning chain management.
 
-        This runs BEFORE the LLM call and handles:
-        - New user input: Strip any existing reasoning, clear stored reasoning
-        - Tool-only turns: Inject stored reasoning from previous response
+        - New user input: Strip reasoning, clear stored chain
+        - Tool-only turns: Inject full reasoning chain
         """
         try:
             messages = data.get("messages", [])
@@ -357,35 +414,38 @@ class DeepSeekContextHandler(CustomLogger):
             interaction_type = self._detect_interaction_type(messages)
             session_id = self._get_session_id(user_api_key_dict)
 
+            if not session_id:
+                logger.warning("No session ID available")
+                return data
+
             if interaction_type == "new_user":
-                logger.info("🧹 New user message detected - stripping reasoning content")
+                logger.info("🧹 New user message - stripping reasoning, clearing chain")
                 cleaned_messages = self._strip_reasoning_from_messages(messages)
                 data["messages"] = cleaned_messages
 
-                # Clear any stored reasoning for this session (fresh turn)
                 await self.storage.delete(session_id)
-                logger.debug(f"Cleared stored reasoning for session {session_id}")
+                logger.debug(f"Cleared reasoning chain for session {session_id[:8]}...")
 
             elif interaction_type == "tool_only":
-                logger.info("🔧 Tool-only interaction - checking for stored reasoning")
+                logger.info("🔧 Tool-only turn - injecting reasoning chain")
 
                 stored = await self.storage.get(session_id)
-                if stored and stored.get("reasoning"):
-                    reasoning = stored["reasoning"]
-                    modified_messages = self._inject_reasoning_into_messages(messages, reasoning)
+                chain = stored.get("reasoning_chain", []) if stored else []
+
+                if chain:
+                    modified_messages = self._inject_reasoning_chain(messages, chain)
                     data["messages"] = modified_messages
-                    logger.info(f"✅ Injected stored reasoning ({len(reasoning)} chars) into tool-only turn")
+                    logger.info(f"✅ Injected {len(chain)} reasoning entries into tool-only turn")
                 else:
-                    logger.warning("⚠️ No stored reasoning found for tool-only interaction")
+                    logger.warning("⚠️ No reasoning chain found for tool-only turn")
 
             return data
 
         except Exception as e:
             logger.error(f"Error in async_pre_call_hook: {e}", exc_info=True)
-            # Fail open - return original data
             return data
 
-    # ==================== Hook 2: Post-Call Success (Non-Streaming) ====================
+    # ==================== Hook 2: Post-Call Success ====================
 
     async def async_post_call_success_hook(
         self,
@@ -394,39 +454,42 @@ class DeepSeekContextHandler(CustomLogger):
         response: Any,
     ) -> Any:
         """
-        Capture and store reasoning content from successful responses.
-
-        This runs AFTER the LLM call, so we extract and store reasoning
-        for potential use in the next tool-only turn.
+        Capture reasoning and append to chain (non-streaming responses).
         """
         try:
             if not isinstance(response, ModelResponse):
                 return response
 
-            messages = data.get("messages", [])
             session_id = self._get_session_id(user_api_key_dict)
+            if not session_id:
+                return response
 
-            # Extract reasoning from response
             reasoning = self._extract_reasoning_from_response(response)
+            if not reasoning:
+                logger.debug("No reasoning in response")
+                return response
 
-            if reasoning:
-                # Store for next turn
-                await self.storage.set(session_id, {
-                    "reasoning": reasoning,
-                    "timestamp": str(uuid.uuid4())  # Simple timestamp placeholder
-                })
-                logger.info(f"💾 Stored reasoning for session {session_id[:8]}... ({len(reasoning)} chars)")
-            else:
-                logger.debug("No reasoning content in response")
+            messages = data.get("messages", [])
+            turn_index = self._count_assistant_turns(messages)
+            has_tool_calls = self._detect_tool_calls_in_response(response)
+
+            entry = {
+                "turn_index": turn_index,
+                "reasoning": reasoning,
+                "has_tool_calls": has_tool_calls,
+                "stored_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            await self.storage.append_to_chain(session_id, entry)
+            logger.info(f"💾 Appended reasoning entry (turn {turn_index}, tools={has_tool_calls}) to chain")
 
             return response
 
         except Exception as e:
             logger.error(f"Error in async_post_call_success_hook: {e}", exc_info=True)
-            # Fail open - return original response
             return response
 
-    # ==================== Hook 3: Post-Call Streaming Iterator ====================
+    # ==================== Hook 3: Post-Call Streaming ====================
 
     async def async_post_call_streaming_iterator_hook(
         self,
@@ -435,45 +498,49 @@ class DeepSeekContextHandler(CustomLogger):
         request_data: Dict[str, Any],
     ) -> AsyncGenerator[ModelResponseStream, None]:
         """
-        Capture and store reasoning content from streaming responses.
-
-        Uses user_api_key_dict as the shared state for session ID consistency
-        with pre-call hook. Wraps the stream to accumulate reasoning chunks
-        and stores them once the stream completes.
+        Capture reasoning from streaming and append to chain.
         """
         reasoning_buffer: List[str] = []
-
         session_id = self._get_session_id(user_api_key_dict)
+        messages = request_data.get("messages", [])
+        turn_index = self._count_assistant_turns(messages)
+        has_tool_calls = False
 
         try:
-
             async for chunk in response:
-                # Extract reasoning from this chunk if present
+                # Check for tool calls in streaming chunks
+                if chunk.choices and chunk.choices[0].delta:
+                    delta = chunk.choices[0].delta
+                    if getattr(delta, "tool_calls", None):
+                        has_tool_calls = True
+
+                # Accumulate reasoning
                 if self._chunk_has_reasoning(chunk):
                     reasoning_piece = self._extract_reasoning_from_chunk(chunk)
                     if reasoning_piece:
                         reasoning_buffer.append(reasoning_piece)
                         logger.debug(f"Accumulated reasoning chunk: {len(reasoning_piece)} chars")
 
-                # Yield chunk unchanged - don't break the flow!
                 yield chunk
 
         except Exception as e:
-            logger.error(f"Error in streaming iterator hook: {e}", exc_info=True)
-            # Re-raise to not swallow errors, but ensure we still try to store reasoning
+            logger.error(f"Error in streaming hook: {e}", exc_info=True)
             raise
 
         finally:
-            # Stream ended - store accumulated reasoning if we have any
+            # Store accumulated reasoning if we have any
             if reasoning_buffer and session_id:
                 try:
                     full_reasoning = "".join(reasoning_buffer)
-                    await self.storage.set(session_id, {
+                    entry = {
+                        "turn_index": turn_index,
                         "reasoning": full_reasoning,
-                        "timestamp": str(uuid.uuid4()),
+                        "has_tool_calls": has_tool_calls,
+                        "stored_at": datetime.now(timezone.utc).isoformat(),
                         "source": "streaming"
-                    })
-                    logger.info(f"💾 Stored streaming reasoning for session {session_id[:8]}... ({len(full_reasoning)} chars)")
+                    }
+                    await self.storage.append_to_chain(session_id, entry)
+                    logger.info(f"💾 Appended streaming reasoning (turn {turn_index}, tools={has_tool_calls}) to chain")
                 except Exception as e:
                     logger.error(f"Failed to store streaming reasoning: {e}")
 
