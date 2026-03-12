@@ -1,4 +1,3 @@
- ```py /Users/oixande/litellm-handlers-hub/reasoning_edge_case_handler/__init__.py
 """
 ReasoningEdgeCaseHandler - LiteLLM Proxy Custom Handler
 
